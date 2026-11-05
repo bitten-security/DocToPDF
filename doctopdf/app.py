@@ -19,7 +19,7 @@ from .converters import (
 )
 
 STYLE = """
-* { font-size: 13px; }
+* { font-size: 13px; color: #1f2430; }
 QMainWindow, QWidget#root { background: #f6f7f9; }
 QLabel#title { font-size: 20px; font-weight: 600; color: #1f2430; }
 QLabel#hint, QLabel#status { color: #6b7280; }
@@ -33,6 +33,8 @@ QLineEdit { background: white; border: 1px solid #d9dde4; border-radius: 6px; pa
 QPushButton { background: white; border: 1px solid #d9dde4; border-radius: 6px; padding: 7px 14px; }
 QPushButton:hover { background: #eef1f6; }
 QPushButton:disabled { color: #a0a6b1; }
+QCheckBox { spacing: 8px; }
+QLineEdit { selection-background-color: #cfe0ff; }
 QPushButton#primary { background: #2f6df6; color: white; border: none; font-weight: 600;
                       padding: 9px 22px; }
 QPushButton#primary:hover { background: #2559d1; }
@@ -310,6 +312,7 @@ class MainWindow(QMainWindow):
 
 def run_gui() -> int:
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("DocToPDF")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(STYLE)
