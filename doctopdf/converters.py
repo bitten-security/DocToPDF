@@ -2,7 +2,7 @@
 
 Backends
   * image  -> Pillow (multi-frame TIFF/GIF become multi-page PDFs)
-  * text   -> Qt text engine (txt, md, html) - no external dependency
+  * text   -> fpdf2 + bundled DejaVu fonts (txt, md, html); pure Python
   * office -> LibreOffice headless (doc/docx/odt/rtf/xls/xlsx/ods/ppt/pptx/odp/csv...)
 
 Every conversion is written to a temp file first and moved into place, so a
@@ -11,11 +11,13 @@ failure never leaves a half-written PDF behind.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp"}
@@ -125,38 +127,121 @@ def _read_text(src: Path) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _ensure_qt():
-    from PySide6.QtGui import QGuiApplication
+def _asset_dir() -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    return base / "assets"
 
-    app = QGuiApplication.instance()
-    if app is None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-        app = QGuiApplication(sys.argv[:1])
-    return app
+
+def _new_pdf():
+    from fpdf import FPDF
+
+    pdf = FPDF(format="A4")
+    pdf.set_margins(18, 18, 18)
+    pdf.set_auto_page_break(True, 18)
+    fonts = _asset_dir() / "fonts"
+    for style, name in (("", "DejaVuSans"), ("B", "DejaVuSans-Bold"),
+                        ("I", "DejaVuSans-Oblique"), ("BI", "DejaVuSans-BoldOblique")):
+        pdf.add_font("DejaVu", style, str(fonts / f"{name}.ttf"))
+    pdf.add_font("DejaVuMono", "", str(fonts / "DejaVuSansMono.ttf"))
+    pdf.add_font("DejaVuMono", "B", str(fonts / "DejaVuSansMono-Bold.ttf"))
+    pdf.set_font("DejaVu", size=11)
+    pdf.add_page()
+    return pdf
+
+
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _plain_to_pdf(text: str, dest: Path) -> None:
+    pdf = _new_pdf()
+    pdf.set_font("DejaVuMono", size=9.5)
+    for line in _CTRL.sub("", text).expandtabs(4).splitlines() or [""]:
+        pdf.multi_cell(0, 4.8, line or " ", new_x="LMARGIN", new_y="NEXT")
+    pdf.output(str(dest))
+
+
+class _TextExtractor(HTMLParser):
+    BLOCK = {"p", "div", "br", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "pre"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self._skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self._skip += 1
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self._skip = max(0, self._skip - 1)
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip:
+            self.parts.append(data)
+
+
+def _html_to_text(html: str) -> str:
+    ex = _TextExtractor()
+    ex.feed(html)
+    return re.sub(r"\n{3,}", "\n\n", "".join(ex.parts)).strip()
+
+
+_DROP_BLOCKS = re.compile(r"<(script|style|head|svg|iframe|object|embed)\b.*?</\1\s*>", re.I | re.S)
+_COMMENTS = re.compile(r"<!--.*?-->", re.S)
+_IMG = re.compile(r"<img\b[^>]*>", re.I)
+_SRC = re.compile(r"""src\s*=\s*(["'])(.*?)\1""", re.I | re.S)
+
+
+def _sanitize_html(html: str, base_dir: Path) -> str:
+    """Drop active content and never fetch remote images; keep local ones."""
+    html = _COMMENTS.sub("", html)
+    html = _DROP_BLOCKS.sub("", html)
+
+    def fix_img(m: re.Match) -> str:
+        src = _SRC.search(m.group(0))
+        if not src:
+            return ""
+        ref = src.group(2).strip()
+        if re.match(r"^[a-z][a-z0-9+.-]*:", ref, re.I) and not re.match(r"^[a-z]:[\\/]", ref, re.I):
+            return ""  # http(s), data:, file:, ... are not loaded
+        local = (base_dir / ref).resolve()
+        if not local.is_file():
+            return ""
+        return f'<img src="{local}" width="400">'
+
+    return _IMG.sub(fix_img, html)
+
+
+def _html_to_pdf(html: str, dest: Path, base_dir: Path) -> None:
+    html = _sanitize_html(html, base_dir)
+    try:
+        pdf = _new_pdf()
+        from fpdf.fonts import FontFace
+
+        mono = FontFace(family="DejaVuMono")
+        pdf.write_html(html, tag_styles={"pre": mono, "code": mono})
+        pdf.output(str(dest))
+    except Exception:  # noqa: BLE001 - odd markup: fall back to readable plain text
+        _plain_to_pdf(_html_to_text(html), dest)
 
 
 def _text_to_pdf(src: Path, dest: Path) -> None:
-    _ensure_qt()
-    from PySide6.QtCore import QMarginsF
-    from PySide6.QtGui import QFont, QPageLayout, QPageSize, QPdfWriter, QTextDocument
-
     ext = src.suffix.lower()
     text = _read_text(src)
-    doc = QTextDocument()
     if ext in (".md", ".markdown"):
-        doc.setMarkdown(text)
-    elif ext in (".html", ".htm"):
-        doc.setHtml(text)
-    else:
-        doc.setDefaultFont(QFont("Monospace", 10))
-        doc.setPlainText(text)
+        import markdown
 
-    writer = QPdfWriter(str(dest))
-    writer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-    writer.setPageMargins(QMarginsF(18, 18, 18, 18), QPageLayout.Unit.Millimeter)
-    writer.setResolution(150)
-    doc.setPageSize(writer.pageLayout().paintRectPixels(writer.resolution()).size().toSizeF())
-    doc.print_(writer)
+        html = markdown.markdown(text, extensions=["tables", "fenced_code", "sane_lists"])
+        _html_to_pdf(html, dest, src.parent)
+    elif ext in (".html", ".htm"):
+        _html_to_pdf(text, dest, src.parent)
+    else:
+        _plain_to_pdf(text, dest)
 
 
 def _office_to_pdf(src: Path, dest: Path) -> None:

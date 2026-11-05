@@ -1,325 +1,307 @@
-"""Qt GUI: drop files, pick an output folder, convert."""
+"""Tkinter GUI (runs on Windows 32/64-bit and Linux): drop files, pick a folder, convert."""
 from __future__ import annotations
 
+import os
+import queue
 import sys
+import threading
+import tkinter as tk
 from pathlib import Path
-
-from PySide6.QtCore import QObject, Qt, QThread, Signal
-from PySide6.QtGui import QDesktopServices, QDragEnterEvent, QDropEvent
-from PySide6.QtCore import QUrl
-from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMainWindow, QProgressBar, QPushButton,
-    QVBoxLayout, QWidget,
-)
+from tkinter import filedialog, ttk
 
 from . import __version__
-from .converters import (
-    SUPPORTED_EXTS, ConversionError, backend_for, collect_files, convert, find_soffice,
-)
+from .converters import SUPPORTED_EXTS, ConversionError, collect_files, convert, find_soffice
 
-STYLE = """
-* { font-size: 13px; color: #1f2430; }
-QMainWindow, QWidget#root { background: #f6f7f9; }
-QLabel#title { font-size: 20px; font-weight: 600; color: #1f2430; }
-QLabel#hint, QLabel#status { color: #6b7280; }
-QLabel#banner { background: #fff4e5; color: #8a5300; border: 1px solid #ffd8a0;
-                border-radius: 6px; padding: 8px 10px; }
-QListWidget { background: white; border: 2px dashed #cfd4dc; border-radius: 10px; padding: 4px; }
-QListWidget[hasItems="true"] { border: 1px solid #d9dde4; }
-QListWidget::item { padding: 6px 8px; border-radius: 6px; }
-QListWidget::item:selected { background: #e8efff; color: #1f2430; }
-QLineEdit { background: white; border: 1px solid #d9dde4; border-radius: 6px; padding: 6px 8px; }
-QPushButton { background: white; border: 1px solid #d9dde4; border-radius: 6px; padding: 7px 14px; }
-QPushButton:hover { background: #eef1f6; }
-QPushButton:disabled { color: #a0a6b1; }
-QCheckBox { spacing: 8px; }
-QLineEdit { selection-background-color: #cfe0ff; }
-QPushButton#primary { background: #2f6df6; color: white; border: none; font-weight: 600;
-                      padding: 9px 22px; }
-QPushButton#primary:hover { background: #2559d1; }
-QPushButton#primary:disabled { background: #a9c0f5; }
-QProgressBar { border: none; background: #e3e7ee; border-radius: 4px; height: 8px; }
-QProgressBar::chunk { background: #2f6df6; border-radius: 4px; }
-"""
+try:  # drag & drop is optional: the app works without it
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:  # noqa: BLE001
+    DND_FILES, TkinterDnD = None, None
 
-PATH_ROLE = 0x0100  # Qt.UserRole
-OUT_ROLE = 0x0101
+BG, CARD, LINE = "#f6f7f9", "#ffffff", "#d9dde4"
+TEXT, MUTED, ACCENT, ACCENT_D = "#1f2430", "#6b7280", "#2f6df6", "#2559d1"
+OK, ERR = "#15803d", "#b91c1c"
 
 
-class Worker(QObject):
-    """Converts files sequentially off the UI thread."""
-
-    progress = Signal(int, bool, str)  # row, ok, message (output path or error)
-    finished = Signal()
-
-    def __init__(self, files: list[Path], out_dir: str | None, overwrite: bool):
-        super().__init__()
-        self._files, self._out, self._overwrite = files, out_dir, overwrite
-        self._cancel = False
-
-    def cancel(self) -> None:
-        self._cancel = True
-
-    def run(self) -> None:
-        for row, f in enumerate(self._files):
-            if self._cancel:
-                break
-            try:
-                res = convert(f, self._out, self._overwrite)
-                self.progress.emit(row, True, str(res.output))
-            except ConversionError as exc:
-                self.progress.emit(row, False, str(exc))
-            except Exception as exc:  # noqa: BLE001 - keep the batch going
-                self.progress.emit(row, False, f"Unexpected error: {exc}")
-        self.finished.emit()
+def _icon_path() -> Path | None:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+    p = base / "assets" / ("icon.ico" if sys.platform == "win32" else "icon.png")
+    return p if p.is_file() else None
 
 
-class DropList(QListWidget):
-    files_dropped = Signal(list)
-
+class App:
     def __init__(self) -> None:
-        super().__init__()
-        self.setAcceptDrops(True)
-        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.setProperty("hasItems", False)
+        self.root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
+        self.root.title(f"DocToPDF {__version__}")
+        self.root.geometry("700x600")
+        self.root.minsize(560, 480)
+        self.root.configure(bg=BG)
+        self._set_icon()
+        self._style()
 
-    def dragEnterEvent(self, e: QDragEnterEvent) -> None:
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
+        self.msgs: queue.Queue = queue.Queue()
+        self.cancel = threading.Event()
+        self.running = False
+        self.done = self.total = 0
+        self.queued: set[Path] = set()
+        self.rows: dict[str, Path] = {}  # tree iid -> source path
+        self.outputs: dict[str, str] = {}  # tree iid -> produced PDF
 
-    dragMoveEvent = dragEnterEvent  # type: ignore[assignment]
+        self.out_var = tk.StringVar()
+        self.over_var = tk.BooleanVar(value=False)
+        self.status_var = tk.StringVar()
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._close)
+        self.root.after(100, self._poll)
 
-    def dropEvent(self, e: QDropEvent) -> None:
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-        if paths:
-            self.files_dropped.emit(paths)
-            e.acceptProposedAction()
-
-    def paintEvent(self, e) -> None:  # centered placeholder when empty
-        super().paintEvent(e)
-        if self.count() == 0:
-            from PySide6.QtGui import QColor, QPainter
-
-            p = QPainter(self.viewport())
-            p.setPen(QColor("#9aa1ad"))
-            p.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter,
-                       "Drop files or folders here\nor use “Add files”")
-
-
-class MainWindow(QMainWindow):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setWindowTitle("DocToPDF")
-        self.resize(640, 560)
-        self._thread: QThread | None = None
-        self._worker: Worker | None = None
-        self._queued: set[Path] = set()
-
-        root = QWidget(objectName="root")
-        self.setCentralWidget(root)
-        lay = QVBoxLayout(root)
-        lay.setContentsMargins(20, 18, 20, 18)
-        lay.setSpacing(12)
-
-        lay.addWidget(QLabel("DocToPDF", objectName="title"))
-        lay.addWidget(QLabel("Convert documents, spreadsheets, slides, images and text to PDF.",
-                             objectName="hint"))
-
-        self.banner = QLabel(
-            "LibreOffice not found: Office files (docx, xlsx, pptx, odt…) can't be converted. "
-            "Images, text, Markdown and HTML still work.", objectName="banner")
-        self.banner.setWordWrap(True)
-        self.banner.setVisible(find_soffice() is None)
-        lay.addWidget(self.banner)
-
-        self.list = DropList()
-        self.list.files_dropped.connect(self.add_paths)
-        lay.addWidget(self.list, 1)
-
-        row = QHBoxLayout()
-        b_add = QPushButton("Add files…")
-        b_add.clicked.connect(self.pick_files)
-        b_dir = QPushButton("Add folder…")
-        b_dir.clicked.connect(self.pick_folder)
-        b_rm = QPushButton("Remove")
-        b_rm.clicked.connect(self.remove_selected)
-        b_clear = QPushButton("Clear")
-        b_clear.clicked.connect(self.clear)
-        for b in (b_add, b_dir, b_rm, b_clear):
-            row.addWidget(b)
-        row.addStretch(1)
-        lay.addLayout(row)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(QLabel("Save to:"))
-        self.out_edit = QLineEdit()
-        self.out_edit.setPlaceholderText("Same folder as each source file")
-        out_row.addWidget(self.out_edit, 1)
-        b_out = QPushButton("Browse…")
-        b_out.clicked.connect(self.pick_output)
-        out_row.addWidget(b_out)
-        lay.addLayout(out_row)
-
-        self.overwrite = QCheckBox("Overwrite existing PDFs (otherwise add “(1)”)")
-        lay.addWidget(self.overwrite)
-
-        self.bar = QProgressBar(textVisible=False)
-        self.bar.setVisible(False)
-        lay.addWidget(self.bar)
-
-        bottom = QHBoxLayout()
-        self.status = QLabel("", objectName="status")
-        bottom.addWidget(self.status, 1)
-        self.go = QPushButton("Convert to PDF", objectName="primary")
-        self.go.clicked.connect(self.toggle_run)
-        self.go.setEnabled(False)
-        bottom.addWidget(self.go)
-        lay.addLayout(bottom)
-
-        self.list.itemDoubleClicked.connect(self.open_result)
-
-    # ---- list management ------------------------------------------------- #
-    def add_paths(self, paths: list) -> None:
-        if self._thread:
+    # ---- setup ------------------------------------------------------------ #
+    def _set_icon(self) -> None:
+        icon = _icon_path()
+        if not icon:
             return
-        files = collect_files(paths)
+        try:
+            if icon.suffix == ".ico":
+                self.root.iconbitmap(default=str(icon))
+            else:
+                self.root.iconphoto(True, tk.PhotoImage(file=str(icon)))
+        except tk.TclError:
+            pass
+
+    def _style(self) -> None:
+        s = ttk.Style(self.root)
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        s.configure("TFrame", background=BG)
+        s.configure("TLabel", background=BG, foreground=TEXT)
+        s.configure("Title.TLabel", font=("Segoe UI", 17, "bold"))
+        s.configure("Muted.TLabel", foreground=MUTED)
+        s.configure("Banner.TLabel", background="#fff4e5", foreground="#8a5300", padding=8)
+        s.configure("TButton", background=CARD, foreground=TEXT, bordercolor=LINE,
+                    lightcolor=CARD, darkcolor=CARD, padding=(12, 6), focuscolor=CARD)
+        s.map("TButton", background=[("active", "#eef1f6")], foreground=[("disabled", "#a0a6b1")])
+        s.configure("Primary.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+                    lightcolor=ACCENT, darkcolor=ACCENT, padding=(22, 8), font=("Segoe UI", 10, "bold"))
+        s.map("Primary.TButton", background=[("active", ACCENT_D), ("disabled", "#a9c0f5")],
+              foreground=[("disabled", "white")])
+        s.configure("TCheckbutton", background=BG, foreground=TEXT, focuscolor=BG)
+        s.configure("TEntry", fieldbackground=CARD, bordercolor=LINE, padding=5)
+        s.configure("Horizontal.TProgressbar", troughcolor="#e3e7ee", background=ACCENT,
+                    bordercolor="#e3e7ee", lightcolor=ACCENT, darkcolor=ACCENT, thickness=8)
+        s.configure("Treeview", background=CARD, fieldbackground=CARD, foreground=TEXT,
+                    bordercolor=LINE, rowheight=28, borderwidth=0)
+        s.map("Treeview", background=[("selected", "#e8efff")], foreground=[("selected", TEXT)])
+        s.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
+
+    def _build(self) -> None:
+        f = ttk.Frame(self.root, padding=(20, 16))
+        f.pack(fill="both", expand=True)
+
+        ttk.Label(f, text="DocToPDF", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(f, text="Convert documents, spreadsheets, slides, images and text to PDF.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
+
+        if find_soffice() is None:
+            ttk.Label(f, text="LibreOffice not found: Office files (docx, xlsx, pptx, odt…) "
+                      "can't be converted. Images, text, Markdown and HTML still work.",
+                      style="Banner.TLabel", wraplength=640, justify="left").pack(fill="x", pady=(0, 10))
+
+        # Bottom bar first so it never gets squeezed out when the window is small.
+        bottom = ttk.Frame(f)
+        bottom.pack(fill="x", pady=(12, 0), side="bottom")
+        ttk.Label(bottom, textvariable=self.status_var, style="Muted.TLabel").pack(side="left")
+        self.go = ttk.Button(bottom, text="Convert to PDF", style="Primary.TButton",
+                             command=self.toggle_run, state="disabled")
+        self.go.pack(side="right")
+        self.progress = ttk.Progressbar(f, mode="determinate")  # packed only while running
+
+        ttk.Checkbutton(f, text="Overwrite existing PDFs (otherwise add “(1)”)",
+                        variable=self.over_var).pack(side="bottom", anchor="w", pady=(8, 0))
+        ttk.Label(f, text="Leave empty to save next to each source file.",
+                  style="Muted.TLabel").pack(side="bottom", anchor="w", pady=(2, 0))
+        out = ttk.Frame(f)
+        out.pack(side="bottom", fill="x", pady=(12, 0))
+        ttk.Label(out, text="Save to:").pack(side="left")
+        ttk.Entry(out, textvariable=self.out_var).pack(side="left", fill="x", expand=True, padx=8)
+        ttk.Button(out, text="Browse…", command=self.pick_output).pack(side="left")
+
+        bar = ttk.Frame(f)
+        bar.pack(side="bottom", fill="x", pady=(10, 0))
+        for text, cmd in (("Add files…", self.pick_files), ("Add folder…", self.pick_folder),
+                          ("Remove", self.remove_selected), ("Clear", self.clear)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=(0, 8))
+
+        box = tk.Frame(f, bg=CARD, highlightbackground=LINE, highlightthickness=1)
+        box.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(box, columns=("file", "result"), show="", selectmode="extended")
+        self.tree.column("#0", width=0, stretch=False)
+        self.tree.column("file", width=300, anchor="w")
+        self.tree.column("result", width=300, anchor="w")
+        self.tree.tag_configure("ok", foreground=OK)
+        self.tree.tag_configure("err", foreground=ERR)
+        sb = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        self.hint = tk.Label(box, text="Drop files or folders here\nor use “Add files…”",
+                             bg=CARD, fg="#9aa1ad", font=("Segoe UI", 11))
+        self.hint.place(relx=0.5, rely=0.5, anchor="center")
+        self.tree.bind("<Double-1>", self._open_result)
+        self.tree.bind("<Delete>", lambda e: self.remove_selected())
+        if DND_FILES:
+            for w in (self.tree, box, self.hint):
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<Drop>>", self._on_drop)
+
+    # ---- list management --------------------------------------------------- #
+    def _on_drop(self, event) -> None:
+        self.add_paths(list(self.root.tk.splitlist(event.data)))
+
+    def add_paths(self, paths: list[str]) -> None:
+        if self.running:
+            return
         added = 0
-        for f in files:
+        for f in collect_files(paths):
             key = f.resolve()
-            if key in self._queued:
+            if key in self.queued:
                 continue
-            self._queued.add(key)
-            item = QListWidgetItem(f"{f.name}    —    {f.parent}")
-            item.setData(PATH_ROLE, str(f))
-            item.setToolTip(str(f))
-            self.list.addItem(item)
+            self.queued.add(key)
+            iid = self.tree.insert("", "end", values=(f.name, str(f.parent)))
+            self.rows[iid] = f
             added += 1
-        if added:
-            self.status.setText(f"{added} file(s) added.")
-        else:
-            self.status.setText("No new supported files found.")
+        self.status_var.set(f"{added} file(s) added." if added else "No new supported files found.")
         self._refresh()
 
     def pick_files(self) -> None:
         exts = " ".join(f"*{e}" for e in sorted(SUPPORTED_EXTS))
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add files", "", f"Supported ({exts})")
+        paths = filedialog.askopenfilenames(
+            title="Add files", filetypes=[("Supported files", exts), ("All files", "*.*")])
         if paths:
-            self.add_paths(paths)
+            self.add_paths(list(paths))
 
     def pick_folder(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Add folder")
+        d = filedialog.askdirectory(title="Add folder")
         if d:
             self.add_paths([d])
 
     def pick_output(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "Output folder")
+        d = filedialog.askdirectory(title="Output folder")
         if d:
-            self.out_edit.setText(d)
+            self.out_var.set(d)
 
     def remove_selected(self) -> None:
-        if self._thread:
+        if self.running:
             return
-        for it in self.list.selectedItems():
-            self._queued.discard(Path(it.data(PATH_ROLE)).resolve())
-            self.list.takeItem(self.list.row(it))
+        for iid in self.tree.selection():
+            self.queued.discard(self.rows.pop(iid).resolve())
+            self.outputs.pop(iid, None)
+            self.tree.delete(iid)
         self._refresh()
 
     def clear(self) -> None:
-        if self._thread:
+        if self.running:
             return
-        self.list.clear()
-        self._queued.clear()
-        self.status.setText("")
+        self.tree.delete(*self.tree.get_children())
+        self.rows.clear()
+        self.outputs.clear()
+        self.queued.clear()
+        self.status_var.set("")
         self._refresh()
 
     def _refresh(self) -> None:
-        self.list.setProperty("hasItems", self.list.count() > 0)
-        self.list.style().unpolish(self.list)
-        self.list.style().polish(self.list)
-        self.list.viewport().update()
-        self.go.setEnabled(self.list.count() > 0 and self._thread is None)
-
-    # ---- conversion ------------------------------------------------------ #
-    def toggle_run(self) -> None:
-        if self._worker:  # running -> cancel
-            self._worker.cancel()
-            self.go.setEnabled(False)
-            self.status.setText("Cancelling after current file…")
-            return
-        files = [Path(self.list.item(i).data(PATH_ROLE)) for i in range(self.list.count())]
-        # Reset previous results
-        for i, f in enumerate(files):
-            self.list.item(i).setText(f"{f.name}    —    {f.parent}")
-            self.list.item(i).setForeground(Qt.GlobalColor.black)
-            self.list.item(i).setData(OUT_ROLE, None)
-        self.bar.setRange(0, len(files))
-        self.bar.setValue(0)
-        self.bar.setVisible(True)
-        self.go.setText("Cancel")
-        self.status.setText(f"Converting 0/{len(files)}…")
-
-        self._worker = Worker(files, self.out_edit.text().strip() or None,
-                              self.overwrite.isChecked())
-        self._thread = QThread(self)
-        self._worker.moveToThread(self._thread)
-        self._thread.started.connect(self._worker.run)
-        self._worker.progress.connect(self.on_progress)
-        self._worker.finished.connect(self.on_finished)
-        self._thread.start()
-
-    def on_progress(self, row: int, ok: bool, msg: str) -> None:
-        item = self.list.item(row)
-        name = Path(item.data(PATH_ROLE)).name
-        if ok:
-            item.setText(f"✓  {name}  →  {Path(msg).name}")
-            item.setForeground(Qt.GlobalColor.darkGreen)
-            item.setData(OUT_ROLE, msg)
-            item.setToolTip(f"{msg}\n(double-click to open)")
+        if self.rows:
+            self.hint.place_forget()
         else:
-            item.setText(f"✗  {name}  —  {msg}")
-            item.setForeground(Qt.GlobalColor.darkRed)
-            item.setToolTip(msg)
-        self.bar.setValue(row + 1)
-        self.status.setText(f"Converting {row + 1}/{self.bar.maximum()}…")
+            self.hint.place(relx=0.5, rely=0.5, anchor="center")
+        self.go.configure(state="normal" if self.rows else "disabled")
 
-    def on_finished(self) -> None:
-        total = self.bar.maximum()
-        ok = sum(1 for i in range(self.list.count()) if self.list.item(i).data(OUT_ROLE))
-        done = self.bar.value()
-        self._thread.quit()
-        self._thread.wait()
-        self._thread = self._worker = None
-        self.go.setText("Convert to PDF")
-        self.status.setText(
-            f"Done: {ok} converted" + (f", {done - ok} failed" if done > ok else "")
-            + (f", {total - done} cancelled" if done < total else "")
+    # ---- conversion --------------------------------------------------------- #
+    def toggle_run(self) -> None:
+        if self.running:
+            self.cancel.set()
+            self.go.configure(state="disabled")
+            self.status_var.set("Cancelling after current file…")
+            return
+        iids = list(self.tree.get_children())
+        for iid in iids:
+            self.tree.item(iid, values=(self.rows[iid].name, str(self.rows[iid].parent)), tags=())
+        self.outputs.clear()
+        self.cancel.clear()
+        self.running = True
+        self.done, self.total = 0, len(iids)
+        self.progress.configure(maximum=self.total, value=0)
+        self.progress.pack(fill="x", pady=(10, 0), side="bottom", before=self.go.master)
+        self.go.configure(text="Cancel")
+        self.status_var.set(f"Converting 0/{self.total}…")
+        jobs = [(iid, self.rows[iid]) for iid in iids]
+        out = self.out_var.get().strip() or None
+        threading.Thread(target=self._work, args=(jobs, out, self.over_var.get()),
+                         daemon=True).start()
+
+    def _work(self, jobs, out, overwrite) -> None:
+        for iid, f in jobs:
+            if self.cancel.is_set():
+                break
+            try:
+                self.msgs.put((iid, True, str(convert(f, out, overwrite).output)))
+            except ConversionError as exc:
+                self.msgs.put((iid, False, str(exc)))
+            except Exception as exc:  # noqa: BLE001 - keep the batch going
+                self.msgs.put((iid, False, f"Unexpected error: {exc}"))
+        self.msgs.put(None)
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                msg = self.msgs.get_nowait()
+                if msg is None:
+                    self._finished()
+                else:
+                    self._progress(*msg)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll)
+
+    def _progress(self, iid: str, ok: bool, msg: str) -> None:
+        if iid not in self.rows:
+            return
+        name = self.rows[iid].name
+        if ok:
+            self.outputs[iid] = msg
+            self.tree.item(iid, values=(f"✓  {name}", f"→ {Path(msg).name}"), tags=("ok",))
+        else:
+            self.tree.item(iid, values=(f"✗  {name}", msg), tags=("err",))
+        self.done += 1
+        self.progress.configure(value=self.done)
+        self.status_var.set(f"Converting {self.done}/{self.total}…")
+
+    def _finished(self) -> None:
+        ok = len(self.outputs)
+        self.running = False
+        self.go.configure(text="Convert to PDF", state="normal")
+        self.progress.pack_forget()
+        self.status_var.set(
+            f"Done: {ok} converted"
+            + (f", {self.done - ok} failed" if self.done > ok else "")
+            + (f", {self.total - self.done} cancelled" if self.done < self.total else "")
             + ". Double-click a converted item to open it.")
-        self._refresh()
 
-    def open_result(self, item: QListWidgetItem) -> None:
-        out = item.data(OUT_ROLE)
+    def _open_result(self, _event) -> None:
+        out = self.outputs.get(self.tree.focus())
         if out and Path(out).is_file():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(out))
+            try:
+                if sys.platform == "win32":
+                    os.startfile(out)  # noqa: S606
+                else:
+                    import subprocess
 
-    def closeEvent(self, e) -> None:
-        if self._worker:
-            self._worker.cancel()
-            self._thread.quit()
-            self._thread.wait(5000)
-        super().closeEvent(e)
+                    subprocess.Popen(["xdg-open", out])
+            except OSError:
+                pass
+
+    def _close(self) -> None:
+        self.cancel.set()
+        self.root.destroy()
 
 
 def run_gui() -> int:
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "assets" / "icon.png"
-    if icon.is_file():
-        from PySide6.QtGui import QIcon
-        app.setWindowIcon(QIcon(str(icon)))
-    app.setApplicationName("DocToPDF")
-    app.setApplicationVersion(__version__)
-    app.setStyleSheet(STYLE)
-    win = MainWindow()
-    win.show()
-    return app.exec()
+    App().root.mainloop()
+    return 0

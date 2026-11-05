@@ -121,3 +121,49 @@ def test_office_real(tmp_path):
     src = tmp_path / "r.rtf"
     src.write_text(r"{\rtf1\ansi Hello}")
     assert is_pdf(convert(src).output)
+
+
+def test_html_sanitizing_and_unicode(tmp_path):
+    src = tmp_path / "x.html"
+    src.write_text(
+        "<h1>Título ✓ → €</h1><script>alert(1)</script>"
+        "<img src='http://127.0.0.1:9/x.png'><p>ok</p>", encoding="utf-8")
+    assert is_pdf(convert(src).output)  # remote image must not be fetched (would raise/hang)
+
+
+def test_malformed_html_falls_back(tmp_path):
+    src = tmp_path / "bad.html"
+    src.write_text("<p><b>unclosed <table><tr><td>x", encoding="utf-8")
+    assert is_pdf(convert(src).output)
+
+
+def test_markdown_table_and_code(tmp_path):
+    src = tmp_path / "m.md"
+    src.write_text("# T\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```\ncode €\n```\n", encoding="utf-8")
+    assert is_pdf(convert(src).output)
+
+
+def test_gui_smoke(tmp_path):
+    import tkinter
+
+    from doctopdf.app import App
+
+    src = tmp_path / "g.txt"
+    src.write_text("hello")
+    try:
+        app = App()
+    except tkinter.TclError:
+        pytest.skip("no display available")
+    try:
+        app.add_paths([str(src)])
+        assert len(app.rows) == 1
+        app.toggle_run()
+        import time
+
+        end = time.time() + 20
+        while app.running and time.time() < end:
+            app.root.update()
+            time.sleep(0.05)
+        assert not app.running and len(app.outputs) == 1
+    finally:
+        app.root.destroy()
