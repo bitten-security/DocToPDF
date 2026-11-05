@@ -313,6 +313,10 @@ class MainWindow(QMainWindow):
 def run_gui() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    icon = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)) / "assets" / "icon.png"
+    if icon.is_file():
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(str(icon)))
     app.setApplicationName("DocToPDF")
     app.setApplicationVersion(__version__)
     app.setStyleSheet(STYLE)

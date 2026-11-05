@@ -30,3 +30,8 @@ pip install -r requirements-dev.txt
 pytest
 python build.py     # standalone binary in dist/ (build on each target OS)
 ```
+
+## Releases
+Tag `vX.Y.Z` and push: GitHub Actions runs the tests, then attaches
+`DocToPDF-Setup-X.Y.Z.exe` (Windows installer, Inno Setup) and `DocToPDF-linux-x86_64.tar.gz` to the release.
+Local installer build (needs Inno Setup 6): `python build.py` then `iscc /DAppVersion=X.Y.Z installer\DocToPDF.iss`.
