@@ -12,6 +12,8 @@ LibreOffice is only needed for Office formats. The app detects it automatically
 (PATH, standard install folders, or `DOCTOPDF_SOFFICE=/path/to/soffice`) and shows a banner if missing.
 
 ## Run
+On Linux, Qt needs a few system libraries (Debian/Ubuntu):
+`sudo apt install libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3 libxcb-cursor0`
 ```bash
 pip install -r requirements.txt
 python -m doctopdf                      # GUI
