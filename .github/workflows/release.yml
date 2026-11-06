@@ -56,7 +56,9 @@ jobs:
           choco install innosetup -y --no-progress
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=$v" "/DArch=${{ matrix.arch }}" installer\DocToPDF.iss
       - uses: actions/upload-artifact@v4
-        with: { name: windows-${{ matrix.arch }}, path: "dist/DocToPDF-Setup-*.exe" }
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/DocToPDF-Setup-*.exe
 
   linux:
     needs: test
